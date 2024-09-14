@@ -1,3 +1,6 @@
+#include <linux/limits.h>
+#include <unistd.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,108 +16,223 @@
 #include "ds.h"
 
 #define MAX_LEN 1024
+#define MAX_LISTEN 10
+
+typedef enum request_kind {
+    GET
+} request_kind;
+
+typedef struct request {
+    request_kind kind;
+    char *path;
+    char *protocol;
+} request_t;
+
+int request_parse(char *buffer, unsigned int buffer_len, request_t *request) {
+    ds_string_slice buffer_slice, token;
+    char *verb = NULL;
+    char *path = NULL;
+    char *protocol = NULL;
+    int result = 0;
+
+    ds_string_slice_init(&buffer_slice, buffer, buffer_len);
+
+    if (ds_string_slice_tokenize(&buffer_slice, ' ', &token) != 0) {
+        DS_LOG_ERROR("expected HTTP verb");
+        return_defer(-1);
+    }
+    if (ds_string_slice_to_owned(&token, &verb) != 0) {
+        DS_LOG_ERROR("buy more ram!");
+        return_defer(-1);
+    }
+
+    if (strcmp(verb, "GET") == 0) {
+        request->kind = GET;
+    } else {
+        DS_LOG_ERROR("not a get request");
+        return_defer(-1);
+    }
+
+    if (ds_string_slice_tokenize(&buffer_slice, ' ', &token) != 0) {
+        DS_LOG_ERROR("expected HTTP path");
+        return_defer(-1);
+    }
+    if (ds_string_slice_to_owned(&token, &path) != 0) {
+        DS_LOG_ERROR("buy more ram!");
+        return_defer(-1);
+    }
+    request->path = path;
+
+    if (ds_string_slice_tokenize(&buffer_slice, '\n', &token) != 0) {
+        DS_LOG_ERROR("expected HTTP protocol");
+        return_defer(-1);
+    }
+    if (ds_string_slice_to_owned(&token, &protocol) != 0) {
+        DS_LOG_ERROR("buy more ram!");
+        return_defer(-1);
+    }
+    request->protocol = protocol;
+
+defer:
+    return result;
+}
+
+int read_path(char *path, char **content) {
+    int result = 0;
+    char cwd[PATH_MAX];
+
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        DS_LOG_ERROR("getcwd: %s", strerror(errno));
+        return_defer(-1);
+    }
+
+    ds_string_builder path_builder;
+    ds_string_builder_init(&path_builder);
+    if (ds_string_builder_append(&path_builder, "%s%s", cwd, path) != 0) {
+        DS_LOG_ERROR("could not create path string");
+        return_defer(-1);
+    }
+
+    char *full_path = NULL;
+    if (ds_string_builder_build(&path_builder, &full_path) != 0) {
+        DS_LOG_ERROR("buy more ram!");
+        return_defer(-1);
+    }
+
+    struct stat path_stat;
+    if (stat(full_path, &path_stat) != 0) {
+        DS_LOG_ERROR("stat: %s", strerror(errno));
+        return_defer(-1);
+    }
+
+    int content_len = 0;
+    if (S_ISREG(path_stat.st_mode)) {
+        content_len = ds_io_read_file(full_path, content);
+    } else if (S_ISDIR(path_stat.st_mode)) {
+        ds_string_builder directory_builder;
+        ds_string_builder_init(&directory_builder);
+        if (ds_string_builder_append(
+            &directory_builder,
+            "<!DOCTYPE HTML>\n<html lang=\"en\">\n<head>\n<meta "
+            "charset=\"utf-8\">\n<title>Directory listing for "
+            "%s</title>\n</head>\n"
+            "<body>\n<h1>Directory listing for %s</h1>\n<hr>\n<ul>\n",
+            path, path) != 0) {
+            DS_LOG_ERROR("could not append to response string");
+            return_defer(-1);
+        }
+
+        DIR *directory = opendir(full_path);
+        struct dirent *dir;
+        if (directory == NULL) {
+            DS_LOG_ERROR("opendir: %s", strerror(errno));
+            return_defer(-1);
+        }
+
+        while ((dir = readdir(directory)) != NULL) {
+            if (ds_string_builder_append(&directory_builder, "<li><a href=\"%s%s\">%s</a></li>\n", path, dir->d_name, dir->d_name) != 0) {
+                DS_LOG_ERROR("could not append to response string");
+                continue;
+            }
+        }
+
+        if (closedir(directory) != 0) {
+            DS_LOG_ERROR("closedir: %s", strerror(errno));
+            return_defer(-1);
+        }
+
+        ds_string_builder_append(&directory_builder, "</ul>\n<hr>\n</body>\n</html>\n");
+        if (ds_string_builder_build(&directory_builder, content) != 0) {
+            DS_LOG_ERROR("buy more ram!");
+            return_defer(-1);
+        }
+
+        content_len = strlen(*content);
+    } else {
+        DS_LOG_ERROR("mode not supported yet");
+        return_defer(-1);
+    }
+
+    result = content_len;
+
+defer:
+    return result;
+}
+
+int handle_request(int cfd) {
+    int result = 0;
+    unsigned int buffer_len = 0;
+    char buffer[MAX_LEN] = {0};
+    request_t request = {0};
+    int content_len;
+    char *content = NULL;
+
+    result = read(cfd, buffer, MAX_LEN);
+    if (result == -1) {
+        DS_LOG_ERROR("read: %s", strerror(errno));
+        return_defer(-1);
+    }
+    buffer_len = result;
+
+    if (request_parse(buffer, buffer_len, &request) == -1) {
+        DS_LOG_ERROR("request parse");
+        // TODO: respond with 400
+        return_defer(-1);
+    }
+
+    result = read_path(request.path, &content);
+    if (result == -1) {
+        DS_LOG_ERROR("read path");
+        return_defer(-1);
+    }
+    content_len = result;
+
+    ds_string_builder response_builder;
+    ds_string_builder_init(&response_builder);
+    ds_string_builder_append(&response_builder, "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: %d\n\n%s", content_len, content);
+    char *response = NULL;
+    ds_string_builder_build(&response_builder, &response);
+    int response_len = strlen(response);
+
+    write(cfd, response, response_len);
+
+defer:
+    return result;
+}
 
 int main() {
     int sfd, cfd, result;
-    socklen_t client_addr_size;
-    struct sockaddr_in addr, client_addr;
+    struct sockaddr_in server_addr;
 
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd == -1) {
-        DS_PANIC("socket");
+        DS_PANIC("socket: %s", strerror(errno));
     }
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(8000);
-    inet_pton(AF_INET, "0.0.0.0", &addr.sin_addr);
-    result = bind(sfd, (struct sockaddr *) &addr, sizeof(addr));
-    if (result == -1) {
-        DS_PANIC("bind");
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8000);
+    inet_pton(AF_INET, "0.0.0.0", &server_addr.sin_addr);
+    if (bind(sfd, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
+        DS_PANIC("bind: %s", strerror(errno));
     }
 
-    result = listen(sfd, 10);
-    if (result == -1) {
-        DS_PANIC("listen");
+    if (listen(sfd, MAX_LISTEN) == -1) {
+        DS_PANIC("listen: %s", strerror(errno));
     }
 
     while (1) {
-        client_addr_size = sizeof(client_addr);
+        int result;
+        char buffer[MAX_LEN] = {0};
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_size = sizeof(client_addr);
+
         cfd = accept(sfd, (struct sockaddr *) &client_addr, &client_addr_size);
         if (cfd == -1) {
-             DS_PANIC("accept");
+             DS_LOG_ERROR("accept: %s", strerror(errno));
+             continue;
         }
 
-        char buffer[MAX_LEN] = {0};
-        int result = read(cfd, buffer, MAX_LEN);
-        if (result == -1) {
-            DS_LOG_ERROR("read");
-            continue;
-        }
-        unsigned int buffer_len = result;
-
-        ds_string_slice request, token;
-        ds_string_slice_init(&request, buffer, buffer_len);
-
-        ds_string_slice_tokenize(&request, ' ', &token);
-        char *verb = NULL;
-        ds_string_slice_to_owned(&token, &verb);
-        if (strcmp(verb, "GET") != 0) {
-            DS_LOG_ERROR("not a get request");
-            // TODO: respond with 400
-            continue;
-        }
-
-        ds_string_slice_tokenize(&request, ' ', &token);
-        char *path = NULL;
-        ds_string_slice_to_owned(&token, &path);
-
-        // TODO: if file does not exists return 404
-        struct stat path_stat;
-        if (stat(path + 1, &path_stat) != 0) {
-            DS_LOG_ERROR("stat");
-            continue;
-        }
-
-        char *content = NULL;
-        int content_len = 0;
-        if (S_ISREG(path_stat.st_mode)) {
-            content_len = ds_io_read_file(path + 1, &content);
-        } else if (S_ISDIR(path_stat.st_mode)) {
-            ds_string_builder directory_builder;
-            ds_string_builder_init(&directory_builder);
-            ds_string_builder_append(
-                &directory_builder,
-                "<!DOCTYPE HTML>\n<html lang=\"en\">\n<head>\n<meta "
-                "charset=\"utf-8\">\n<title>Directory listing for "
-                "%s</title>\n</head>\n"
-                "<body>\n<h1>Directory listing for %s</h1>\n<hr>\n<ul>\n",
-                path, path);
-
-            DIR *directory = opendir(path + 1);
-            struct dirent *dir;
-            if (directory) {
-                while ((dir = readdir(directory)) != NULL) {
-                    ds_string_builder_append(&directory_builder, "<li><a href=\"%s/%s\">%s</a></li>\n", path + 1, dir->d_name, dir->d_name);
-                }
-                closedir(directory);
-            }
-
-            ds_string_builder_append(&directory_builder, "</ul>\n<hr>\n</body>\n</html>\n");
-            ds_string_builder_build(&directory_builder, &content);
-            content_len = strlen(content);
-
-        } else {
-            DS_LOG_ERROR("mode not supported yet");
-            continue;
-        }
-
-        ds_string_builder response_builder;
-        ds_string_builder_init(&response_builder);
-        ds_string_builder_append(&response_builder, "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: %d\n\n%s", content_len, content);
-        char *response = NULL;
-        ds_string_builder_build(&response_builder, &response);
-        int response_len = strlen(response);
-        write(cfd, response, response_len);
+        handle_request(cfd);
     }
 
     result = close(sfd);
