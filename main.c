@@ -13,6 +13,7 @@
 #define DS_SB_IMPLEMENTATION
 #define DS_SS_IMPLEMENTATION
 #define DS_IO_IMPLEMENTATION
+#define DS_AP_IMPLEMENTATION
 #include "ds.h"
 
 #define MAX_LEN 1024
@@ -77,18 +78,12 @@ defer:
     return result;
 }
 
-int read_path(char *path, char **content) {
+int read_path(char* prefix, char *path, char **content) {
     int result = 0;
-    char cwd[PATH_MAX];
-
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        DS_LOG_ERROR("getcwd: %s", strerror(errno));
-        return_defer(-1);
-    }
 
     ds_string_builder path_builder;
     ds_string_builder_init(&path_builder);
-    if (ds_string_builder_append(&path_builder, "%s%s", cwd, path) != 0) {
+    if (ds_string_builder_append(&path_builder, "%s%s", prefix, path) != 0) {
         DS_LOG_ERROR("could not create path string");
         return_defer(-1);
     }
@@ -159,7 +154,7 @@ defer:
     return result;
 }
 
-int handle_request(int cfd) {
+int handle_request(int cfd, char* prefix_directory) {
     int result = 0;
     unsigned int buffer_len = 0;
     char buffer[MAX_LEN] = {0};
@@ -180,7 +175,7 @@ int handle_request(int cfd) {
         return_defer(-1);
     }
 
-    result = read_path(request.path, &content);
+    result = read_path(prefix_directory, request.path, &content);
     if (result == -1) {
         DS_LOG_ERROR("read path");
         return_defer(-1);
@@ -200,9 +195,45 @@ defer:
     return result;
 }
 
-int main() {
-    int sfd, cfd, result;
+int main(int argc, char *argv[]) {
+    int sfd, cfd, result, port;
+    char *prefix_directory = NULL;
     struct sockaddr_in server_addr;
+    ds_argparse_parser parser;
+
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        DS_PANIC("getcwd: %s", strerror(errno));
+    }
+    ds_string_builder directory_builder;
+    ds_string_builder_init(&directory_builder);
+    ds_string_builder_append(&directory_builder, "%s", cwd);
+
+    ds_argparse_parser_init(&parser, "http.server", "A clone of http.server in C", "1.0");
+    ds_argparse_add_argument(
+        &parser, (ds_argparse_options){.short_name = 'p',
+                                       .long_name = "port",
+                                       .description =
+                                           "bind to this port (default: 8000)",
+                                       .type = ARGUMENT_TYPE_POSITIONAL,
+                                       .required = 0});
+    ds_argparse_add_argument(
+        &parser, (ds_argparse_options){.short_name = 'd',
+                                       .long_name = "directory",
+                                       .description =
+                                           "serve this directory (default: current directory)",
+                                       .type = ARGUMENT_TYPE_VALUE,
+                                       .required = 0});
+
+    ds_argparse_parse(&parser, argc, argv);
+    char *port_value = ds_argparse_get_value(&parser, "port");
+    port = (port_value == NULL) ? 8000 : atoi(port_value);
+
+    char *directory_value = ds_argparse_get_value(&parser, "directory");
+    if (directory_value != NULL) {
+        ds_string_builder_append(&directory_builder, "/%s", directory_value);
+    }
+    ds_string_builder_build(&directory_builder, &prefix_directory);
 
     sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd == -1) {
@@ -210,7 +241,7 @@ int main() {
     }
 
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(8000);
+    server_addr.sin_port = htons(port);
     inet_pton(AF_INET, "0.0.0.0", &server_addr.sin_addr);
     if (bind(sfd, (struct sockaddr *) &server_addr, sizeof(server_addr)) == -1) {
         DS_PANIC("bind: %s", strerror(errno));
@@ -219,6 +250,7 @@ int main() {
     if (listen(sfd, MAX_LISTEN) == -1) {
         DS_PANIC("listen: %s", strerror(errno));
     }
+    DS_LOG_INFO("listening on port %d serving from %s", port, prefix_directory);
 
     while (1) {
         int result;
@@ -232,7 +264,7 @@ int main() {
              continue;
         }
 
-        handle_request(cfd);
+        handle_request(cfd, prefix_directory);
     }
 
     result = close(sfd);
