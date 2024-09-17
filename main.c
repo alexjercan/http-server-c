@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#define DS_DA_IMPLEMENTATION
 #define DS_SB_IMPLEMENTATION
 #define DS_SS_IMPLEMENTATION
 #define DS_IO_IMPLEMENTATION
@@ -18,16 +19,104 @@
 
 #define MAX_LEN 1024
 #define MAX_LISTEN 10
+#define NOT_FOUND_STR "Not found"
+#define BAD_REQUEST_STR "Bad request"
 
 typedef enum request_kind {
     GET
 } request_kind;
+
+typedef enum protocol_kind {
+    HTTP_1_1
+} protocol_kind;
 
 typedef struct request {
     request_kind kind;
     char *path;
     char *protocol;
 } request_t;
+
+typedef struct header {
+    char *key;
+    char *value;
+} header_t;
+
+typedef struct response {
+    protocol_kind protocol;
+    int status_code;
+    ds_dynamic_array headers; // header_t
+    char *content;
+} response_t;
+
+const char *protocol_kind_serialize(protocol_kind kind) {
+    switch (kind) {
+    case HTTP_1_1:
+      return "HTTP/1.1";
+    }
+}
+
+const char *headers_serialize(ds_dynamic_array *headers) {
+    char *buffer = NULL;
+    ds_string_builder buffer_builder;
+    ds_string_builder_init(&buffer_builder);
+
+    for (int i = 0; i < headers->count; i++) {
+        header_t header;
+        ds_dynamic_array_get(headers, i, &header);
+
+        ds_string_builder_append(&buffer_builder, "%s: %s\n", header.key, header.value);
+    }
+
+    ds_string_builder_build(&buffer_builder, &buffer);
+
+    return buffer;
+}
+
+const char *status_code_serialize(int status_code) {
+    if (status_code == 200) {
+        return "200 OK";
+    }
+    if (status_code == 400) {
+        return "400 BAD_REQUEST";
+    }
+    if (status_code == 404) {
+        return "404 NOT_FOUND";
+    }
+    if (status_code == 500) {
+        return "500";
+    }
+
+    return "";
+}
+
+int response_serialize(response_t *response, char **buffer) {
+    int result = 0;
+    ds_string_builder response_builder;
+    ds_string_builder_init(&response_builder);
+
+    ds_string_builder_append(&response_builder, "%s %s\n%s\n%s",
+                             protocol_kind_serialize(response->protocol),
+                             status_code_serialize(response->status_code),
+                             headers_serialize(&response->headers),
+                             response->content);
+
+    ds_string_builder_build(&response_builder, buffer);
+    result = strlen(*buffer);
+
+defer:
+    return result;
+}
+
+int response_write(int cfd, response_t *response) {
+    int result = 0;
+    char *buffer = NULL;
+    int buffer_len = response_serialize(response, &buffer);
+
+    result = write(cfd, buffer, buffer_len);
+
+defer:
+    return result;
+}
 
 int request_parse(char *buffer, unsigned int buffer_len, request_t *request) {
     ds_string_slice buffer_slice, token;
@@ -78,6 +167,7 @@ defer:
     return result;
 }
 
+// TODO: different return code for differnt types of errors -1 for not found -2 for out of memory
 int read_path(char* prefix, char *path, char **content) {
     int result = 0;
 
@@ -156,14 +246,19 @@ defer:
 
 int handle_request(int cfd, char* prefix_directory) {
     int result = 0;
+    int content_len;
     unsigned int buffer_len = 0;
     char buffer[MAX_LEN] = {0};
     request_t request = {0};
-    int content_len;
     char *content = NULL;
+    response_t response = {0};
+    ds_dynamic_array_init(&response.headers, sizeof(header_t));
+
+    response.protocol = HTTP_1_1;
 
     result = read(cfd, buffer, MAX_LEN);
     if (result == -1) {
+        response.status_code = 500;
         DS_LOG_ERROR("read: %s", strerror(errno));
         return_defer(-1);
     }
@@ -171,27 +266,65 @@ int handle_request(int cfd, char* prefix_directory) {
 
     if (request_parse(buffer, buffer_len, &request) == -1) {
         DS_LOG_ERROR("request parse");
-        // TODO: respond with 400
+        response.status_code = 400;
+        {
+            header_t header = {.key = "Content-Type", .value = "text/html"};
+            ds_dynamic_array_append(&response.headers, &header);
+        }
+        {
+            ds_string_builder content_len_builder;
+            ds_string_builder_init(&content_len_builder);
+            ds_string_builder_append(&content_len_builder, "%d", strlen(BAD_REQUEST_STR));
+            char *content_len;
+            ds_string_builder_build(&content_len_builder, &content_len);
+            header_t header = {.key = "Content-Length", .value = content_len};
+            ds_dynamic_array_append(&response.headers, &header);
+        }
+        response.content = BAD_REQUEST_STR;
         return_defer(-1);
     }
 
     result = read_path(prefix_directory, request.path, &content);
     if (result == -1) {
         DS_LOG_ERROR("read path");
+        response.status_code = 404;
+        {
+            header_t header = {.key = "Content-Type", .value = "text/html"};
+            ds_dynamic_array_append(&response.headers, &header);
+        }
+        {
+            ds_string_builder content_len_builder;
+            ds_string_builder_init(&content_len_builder);
+            ds_string_builder_append(&content_len_builder, "%d", strlen(NOT_FOUND_STR));
+            char *content_len;
+            ds_string_builder_build(&content_len_builder, &content_len);
+            header_t header = {.key = "Content-Length", .value = content_len};
+            ds_dynamic_array_append(&response.headers, &header);
+        }
+        response.content = NOT_FOUND_STR;
         return_defer(-1);
     }
     content_len = result;
 
-    ds_string_builder response_builder;
-    ds_string_builder_init(&response_builder);
-    ds_string_builder_append(&response_builder, "HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: %d\n\n%s", content_len, content);
-    char *response = NULL;
-    ds_string_builder_build(&response_builder, &response);
-    int response_len = strlen(response);
-
-    write(cfd, response, response_len);
+    response.status_code = 200;
+    {
+        header_t header = {.key = "Content-Type", .value = "text/html"};
+        ds_dynamic_array_append(&response.headers, &header);
+    }
+    {
+        ds_string_builder content_len_builder;
+        ds_string_builder_init(&content_len_builder);
+        ds_string_builder_append(&content_len_builder, "%d", content_len);
+        char *content_len;
+        ds_string_builder_build(&content_len_builder, &content_len);
+        header_t header = {.key = "Content-Length", .value = content_len};
+        ds_dynamic_array_append(&response.headers, &header);
+    }
+    response.content = content;
 
 defer:
+    response_write(cfd, &response);
+
     return result;
 }
 
