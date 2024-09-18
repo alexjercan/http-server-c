@@ -118,6 +118,13 @@ defer:
     return result;
 }
 
+const char *serialize_request_kind(request_kind kind) {
+    switch (kind) {
+    case GET:
+        return "GET";
+    }
+}
+
 int request_parse(char *buffer, unsigned int buffer_len, request_t *request) {
     ds_string_slice buffer_slice, token;
     char *verb = NULL;
@@ -126,6 +133,8 @@ int request_parse(char *buffer, unsigned int buffer_len, request_t *request) {
     int result = 0;
 
     ds_string_slice_init(&buffer_slice, buffer, buffer_len);
+
+    DS_LOG_DEBUG("got request: \n---\n%s\n---", buffer);
 
     if (ds_string_slice_tokenize(&buffer_slice, ' ', &token) != 0) {
         DS_LOG_ERROR("expected HTTP verb");
@@ -173,7 +182,7 @@ int read_path(char* prefix, char *path, char **content) {
 
     ds_string_builder path_builder;
     ds_string_builder_init(&path_builder);
-    if (ds_string_builder_append(&path_builder, "%s%s", prefix, path) != 0) {
+    if (ds_string_builder_append(&path_builder, "%s/%s", prefix, path + 1) != 0) {
         DS_LOG_ERROR("could not create path string");
         return_defer(-1);
     }
@@ -183,6 +192,8 @@ int read_path(char* prefix, char *path, char **content) {
         DS_LOG_ERROR("buy more ram!");
         return_defer(-1);
     }
+
+    DS_LOG_DEBUG("full path to the file/directory is %s", full_path);
 
     struct stat path_stat;
     if (stat(full_path, &path_stat) != 0) {
@@ -215,7 +226,7 @@ int read_path(char* prefix, char *path, char **content) {
         }
 
         while ((dir = readdir(directory)) != NULL) {
-            if (ds_string_builder_append(&directory_builder, "<li><a href=\"%s%s\">%s</a></li>\n", path, dir->d_name, dir->d_name) != 0) {
+            if (ds_string_builder_append(&directory_builder, "<li><a href=\"%s/%s\">%s</a></li>\n", path + 1, dir->d_name, dir->d_name) != 0) {
                 DS_LOG_ERROR("could not append to response string");
                 continue;
             }
@@ -244,6 +255,39 @@ defer:
     return result;
 }
 
+int headers_append_value(ds_dynamic_array *headers, char *key, char *value) {
+    header_t header = {.key = key, .value = value};
+    return ds_dynamic_array_append(headers, &header);
+}
+
+char *itoa(int value) {
+    ds_string_builder string_builder;
+    ds_string_builder_init(&string_builder);
+    ds_string_builder_append(&string_builder, "%d", value);
+    char *buffer;
+    ds_string_builder_build(&string_builder, &buffer);
+    return buffer;
+}
+
+char *get_content_type(char *path) {
+    ds_string_slice path_slice, token;
+    ds_string_slice_init(&path_slice, path, strlen(path));
+
+    ds_string_slice_tokenize(&path_slice, '.', &token);
+    char *suffix = NULL;
+    ds_string_slice_to_owned(&path_slice, &suffix);
+
+    if (strcmp(suffix, "html") == 0 || *suffix == 0) {
+        return "text/html";
+    } else if (strcmp(suffix, "pdf") == 0) {
+        return "application/pdf";
+    } else if (strcmp(suffix, "json") == 0) {
+        return "application/json";
+    } else {
+        return "text/plain";
+    }
+}
+
 int handle_request(int cfd, char* prefix_directory) {
     int result = 0;
     int content_len;
@@ -267,59 +311,30 @@ int handle_request(int cfd, char* prefix_directory) {
     if (request_parse(buffer, buffer_len, &request) == -1) {
         DS_LOG_ERROR("request parse");
         response.status_code = 400;
-        {
-            header_t header = {.key = "Content-Type", .value = "text/html"};
-            ds_dynamic_array_append(&response.headers, &header);
-        }
-        {
-            ds_string_builder content_len_builder;
-            ds_string_builder_init(&content_len_builder);
-            ds_string_builder_append(&content_len_builder, "%d", strlen(BAD_REQUEST_STR));
-            char *content_len;
-            ds_string_builder_build(&content_len_builder, &content_len);
-            header_t header = {.key = "Content-Length", .value = content_len};
-            ds_dynamic_array_append(&response.headers, &header);
-        }
+        headers_append_value(&response.headers, "Content-Type", "text/html");
+        headers_append_value(&response.headers, "Content-Length", itoa(strlen(BAD_REQUEST_STR)));
         response.content = BAD_REQUEST_STR;
         return_defer(-1);
     }
+
+    DS_LOG_INFO("incoming request %s %s", serialize_request_kind(request.kind), request.path);
 
     result = read_path(prefix_directory, request.path, &content);
     if (result == -1) {
         DS_LOG_ERROR("read path");
         response.status_code = 404;
-        {
-            header_t header = {.key = "Content-Type", .value = "text/html"};
-            ds_dynamic_array_append(&response.headers, &header);
-        }
-        {
-            ds_string_builder content_len_builder;
-            ds_string_builder_init(&content_len_builder);
-            ds_string_builder_append(&content_len_builder, "%d", strlen(NOT_FOUND_STR));
-            char *content_len;
-            ds_string_builder_build(&content_len_builder, &content_len);
-            header_t header = {.key = "Content-Length", .value = content_len};
-            ds_dynamic_array_append(&response.headers, &header);
-        }
+        headers_append_value(&response.headers, "Content-Type", "text/html");
+        headers_append_value(&response.headers, "Content-Length", itoa(strlen(NOT_FOUND_STR)));
         response.content = NOT_FOUND_STR;
         return_defer(-1);
     }
     content_len = result;
 
+    char *content_type = get_content_type(request.path);
+
     response.status_code = 200;
-    {
-        header_t header = {.key = "Content-Type", .value = "text/html"};
-        ds_dynamic_array_append(&response.headers, &header);
-    }
-    {
-        ds_string_builder content_len_builder;
-        ds_string_builder_init(&content_len_builder);
-        ds_string_builder_append(&content_len_builder, "%d", content_len);
-        char *content_len;
-        ds_string_builder_build(&content_len_builder, &content_len);
-        header_t header = {.key = "Content-Length", .value = content_len};
-        ds_dynamic_array_append(&response.headers, &header);
-    }
+    headers_append_value(&response.headers, "Content-Type", content_type);
+    headers_append_value(&response.headers, "Content-Length", itoa(content_len));
     response.content = content;
 
 defer:
